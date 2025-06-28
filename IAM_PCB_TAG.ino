@@ -34,13 +34,15 @@ CRGB leds[NUM_LEDS];
 
 // --- BLE Definitions ---
 BLEServer* pServer = NULL;
-BLECharacteristic* pCharacteristic = NULL;
+BLECharacteristic* pCharacteristic = NULL;        // For sending data (notifications)
+BLECharacteristic* pReceiveCharacteristic = NULL; // For receiving data (write)
 bool deviceConnected = false;
 
 // See the following for generating UUIDs:
 // https://www.uuidgenerator.net/
-#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define SERVICE_UUID           "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHARACTERISTIC_UUID    "beb5483e-36e1-4688-b7f5-ea07361b26a8"  // Send characteristic
+#define RECEIVE_CHAR_UUID      "beb5483e-36e1-4688-b7f5-ea07361b26a9"  // Receive characteristic
 
 // --- State Machine Definitions ---
 enum DeviceState {
@@ -72,12 +74,40 @@ struct PacketData {
   int rssi;               // Bluetooth RSSI
 };
 
+// --- Received Data Storage ---
+struct ReceivedData {
+  String timestamp;        // Last received timestamp
+  float latitude;          // Last received GPS latitude
+  float longitude;         // Last received GPS longitude
+  float altitude;          // Last received GPS altitude
+  int rssi;               // Last received RSSI
+  bool hasReceivedData;    // Flag to indicate if we've received valid data
+};
+
+ReceivedData receivedData = {"", 0.0, 0.0, 0.0, 0, false};
+
 // --- LED State Variables ---
 bool ledState = false;
 unsigned long ledFlashRate = 500;     // Variable flash rate based on state
 
 // Forward declarations
 void changeState(DeviceState newState);
+void parseReceivedPacket(String packet);
+
+// BLE Characteristic Callbacks for receiving data
+class MyCharacteristicCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic* pCharacteristic) {
+      String value = String(pCharacteristic->getValue().c_str());
+      
+      if (value.length() > 0) {
+        Serial.print("Received packet: ");
+        Serial.println(value);
+        
+        // Parse the received packet
+        parseReceivedPacket(value);
+      }
+    }
+};
 
 // BLE Server Callbacks to monitor connections
 class MyServerCallbacks: public BLEServerCallbacks {
@@ -260,13 +290,22 @@ String getCurrentTimestamp() {
 PacketData gatherSensorData() {
   PacketData data;
   
-  // Get current timestamp
-  data.timestamp = getCurrentTimestamp();
-  
-  // Placeholder GPS coordinates (replace with actual GPS module data)
-  data.latitude = 40.7128;   // Example: New York City latitude
-  data.longitude = -74.0060; // Example: New York City longitude
-  data.altitude = 10.0;      // Example altitude in meters
+  // If we have received data, use that for GPS and timestamp
+  if (receivedData.hasReceivedData) {
+    data.timestamp = receivedData.timestamp;
+    data.latitude = receivedData.latitude;
+    data.longitude = receivedData.longitude;
+    data.altitude = receivedData.altitude;
+    Serial.println("Using received GPS and timestamp data");
+  } else {
+    // Get current timestamp
+    data.timestamp = getCurrentTimestamp();
+    
+    // Placeholder GPS coordinates (replace with actual GPS module data)
+    data.latitude = 26.3082;   // Example: UTRGV latitude
+    data.longitude = -98.1740; // Example: UTRGV longitude (negative for western hemisphere)
+    data.altitude = 10.0;      // Example altitude in meters
+  }
   
   // Get RSSI if connected
   if (deviceConnected) {
@@ -302,6 +341,71 @@ bool sendPacket(String packet) {
     return true;
   } catch (...) {
     return false;
+  }
+}
+
+// ========================================
+// PACKET PARSING FUNCTIONS
+// ========================================
+
+void parseReceivedPacket(String packet) {
+  // Expected format: MM/DD/YYYY, HH:MM:SS, Latitude, Longitude, Altitude
+  // Example: "12/28/2025, 14:30:45, 40.712800, -74.006000, 10.00"
+  // NOTE: RSSI is NOT accepted from incoming packets - it's determined locally
+  
+  int commaCount = 0;
+  int lastIndex = 0;
+  String parts[5]; // date, time, latitude, longitude, altitude
+  
+  // Count commas and split string
+  for (int i = 0; i < packet.length(); i++) {
+    if (packet.charAt(i) == ',') {
+      if (commaCount < 5) {
+        parts[commaCount] = packet.substring(lastIndex, i);
+        parts[commaCount].trim(); // Remove whitespace
+      }
+      commaCount++;
+      lastIndex = i + 1;
+    }
+  }
+  
+  // Get the last part (altitude)
+  if (commaCount >= 4 && lastIndex < packet.length()) {
+    parts[commaCount] = packet.substring(lastIndex);
+    parts[commaCount].trim();
+  }
+  
+  // Validate we have enough parts (should be 4: date, time, lat, lon, alt)
+  if (commaCount >= 4) {
+    try {
+      // Combine date and time for timestamp
+      receivedData.timestamp = parts[0] + ", " + parts[1];
+      
+      // Parse GPS coordinates and altitude
+      receivedData.latitude = parts[2].toFloat();
+      receivedData.longitude = parts[3].toFloat();
+      receivedData.altitude = parts[4].toFloat();
+      
+      // RSSI is NOT updated from received packets - it remains 0 in received data
+      // The actual RSSI will be determined by the ESP32's own BLE connection
+      receivedData.rssi = 0;
+      
+      receivedData.hasReceivedData = true;
+      
+      Serial.println("Successfully parsed received packet:");
+      Serial.println("  Timestamp: " + receivedData.timestamp);
+      Serial.println("  Latitude: " + String(receivedData.latitude, 6));
+      Serial.println("  Longitude: " + String(receivedData.longitude, 6));
+      Serial.println("  Altitude: " + String(receivedData.altitude, 2));
+      Serial.println("  RSSI will be determined locally (not from packet)");
+      
+    } catch (...) {
+      Serial.println("Error parsing received packet - invalid format");
+    }
+  } else {
+    Serial.println("Error: Received packet has insufficient data fields");
+    Serial.println("Expected format: MM/DD/YYYY, HH:MM:SS, Latitude, Longitude, Altitude");
+    Serial.println("Note: RSSI is determined locally and should not be included in incoming packets");
   }
 }
 
@@ -378,13 +482,21 @@ void initializeBLE() {
   // Create the BLE Service
   BLEService *pService = pServer->createService(SERVICE_UUID);
 
-  // Create a BLE Characteristic
+  // Create a BLE Characteristic for sending data (notifications)
   pCharacteristic = pService->createCharacteristic(
                       CHARACTERISTIC_UUID,
                       BLECharacteristic::PROPERTY_NOTIFY
                     );
   // Add a descriptor to the characteristic
   pCharacteristic->addDescriptor(new BLE2902());
+
+  // Create a BLE Characteristic for receiving data (write)
+  pReceiveCharacteristic = pService->createCharacteristic(
+                            RECEIVE_CHAR_UUID,
+                            BLECharacteristic::PROPERTY_WRITE
+                          );
+  // Set callback for when data is written to this characteristic
+  pReceiveCharacteristic->setCallbacks(new MyCharacteristicCallbacks());
 
   // Start the service
   pService->start();
@@ -397,4 +509,5 @@ void initializeBLE() {
   pAdvertising->setMinPreferred(0x12);
   BLEDevice::startAdvertising();
   Serial.println("BLE Initialized and Advertising Started.");
+  Serial.println("Device can now send and receive data packets.");
 }
